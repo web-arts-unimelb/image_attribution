@@ -1,0 +1,5 @@
+name = Image attribution
+description = Add an attribution text field to images.
+core = 7.x
+
+dependencies[] = image

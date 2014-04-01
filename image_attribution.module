@@ -1,0 +1,356 @@
+<?php
+/**
+ * @file image_attribution.module
+ */
+
+define ('IMAGE_ATTRIBUTION_TABLE', 'image_attribution');
+define ('IMAGE_ATTRIBUTION_REVISION_TABLE', 'image_attribution_revision');
+
+/**
+ * Implements hook_theme_registry_alter().
+ */
+function image_attribution_theme_registry_alter(&$theme_registry) {
+  // Override the image_formatter function and add attribution as a variable to be
+  // assembled by theme().
+  $theme_registry['image_formatter']['theme path'] = drupal_get_path('module', 'image_attribution') . '/templates';
+  $theme_registry['image_formatter']['function'] = 'image_attribution_image_formatter';
+
+  if (module_exists('insert')) {
+    $theme_registry['insert_image']['template'] = drupal_get_path('module', 'image_attribution') . '/templates/insert-image';
+    $theme_registry['image_insert_image']['template'] = drupal_get_path('module', 'image_attribution') . '/templates/image-insert-image';
+  }
+}
+
+/**
+ * Override of theme_image_formatter().
+ */
+function image_field_caption_image_formatter($variables) {
+  $image = theme_image_formatter($variables);
+  // Now that Drupal has rendered the image, if there was attribution let's
+  // render the image and the attribution, otherwise just return the already
+  // rendered image.
+  if (!empty($variables['item']['image_attribution'])) {
+    return theme('image_attribution', array(
+      'image' => $image,
+      'attribution' => check_markup($variables['item']['image_attribution'], 'filtered_html'),
+    ));
+  }
+  return $image;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function image_attribution_theme($existing, $type, $theme, $path) {
+  return array(
+    'image_attribution' => array(
+      'template' => 'image_attribution',
+      'variables' => array('image' => NULL, 'attribution' => NULL),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_info_alter().
+ */
+function image_attribution_field_info_alter(&$info) {
+  // Add a setting to all field types.
+  foreach ($info as $field_type => $field_type_info) {
+    if ($field_type == 'image') {
+      $info['image']['instance_settings'] += array(
+        'image_attribution' => FALSE,
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_field_widget_info_alter().
+ */
+function image_attribution_field_widget_info_alter(&$info) {
+  $info['image_image']['settings'] += array(
+    'image_attribution' => FALSE,
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function image_attribution_form_field_ui_field_edit_form_alter(&$form, $form_state) {
+  // Adds setting to the Image field edit form.
+  $instance = $form['#instance'];
+  if ($instance['widget']['type'] == 'image_image') {
+    if (empty($form['instance']['settings'])) {
+      $form['instance']['settings'] = array();
+    }
+    $form['instance']['settings'] += image_attribution_field_instance_settings_form($field, $instance);
+  }
+}
+
+/**
+ * Helper that returns a setting snippet for our attribution field.
+ */
+function image_attribution_field_instance_settings_form($field, $instance) {
+  $form['image_attribution'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable <em>Attribution</em> field'),
+    '#default_value' => $instance['settings']['image_attribution'],
+    '#description' => t('Do you want to enable Image attribution for this field?'),
+    '#weight' => 12,
+  );
+  return $form;
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function image_attribution_field_widget_form_alter(&$element, &$form_state, $context) {
+  $instance = $context['instance'];
+  $settings = $instance['settings'];
+  $field = $context['field'];
+
+  if (!empty($settings['image_attribution']) && $field['type'] == 'image') {
+    foreach (element_children($element) as $delta) {
+      // Add all extra functionality provided by the image widget.
+      $element[$delta]['#process'][] = 'image_attribution_widget_process';
+    }
+  }
+}
+
+/**
+ * An element #process callback to add the attribution textfield.
+ */
+function image_attribution_widget_process($element, &$form_state, $form) {
+  $item = $element['#value'];
+
+  // Add the additional alt and title fields.
+  $element['image_attribution'] = array(
+    '#title' => t('Attribution'),
+    '#type' => 'textfield',
+    '#description' => t('The attribution is shown as caption below the image when appropriate.'),
+    '#default_value' => isset($item['image_attribution']) ? $item['image_attribution'] : '',
+    '#access' => (bool) $item['fid'],
+  );
+
+  return $element;
+}
+
+/**
+ * Implements hook_field_attach_insert().
+ */
+function image_attribution_field_attach_insert($entity_type, $entity) {
+  image_attribution_field_attach_update($entity_type, $entity);
+}
+
+/**
+ * Implements hook_field_attach_update().
+ */
+function image_attribution_field_attach_update($entity_type, $entity) {
+  list($id, $vid, $bundle) = entity_extract_ids($entity_type, $entity);
+
+  if (!isset($vid)) {
+    $vid = $id;
+  }
+
+  $image_fields = image_attribution_get_image_fields($entity_type, $bundle);
+
+  foreach ($image_fields as $field_name => $image_field) {
+    if (!$image_field['settings']['image_attribution']) {
+      continue;
+    }
+    $field = field_info_field($field_name);
+
+    $all_languages = field_available_languages($entity_type, $field);
+    $field_languages = array_intersect($all_languages, array_keys((array) $entity->$field_name));
+
+    // Delete and insert, rather than update, in case a value was added.
+    // Delete languages present in the incoming $entity->$field_name.
+    // Delete all languages if $entity->$field_name is empty.
+    $languages = !empty($entity->$field_name) ? $field_languages : $all_languages;
+    if ($languages) {
+      db_delete(IMAGE_ATTRIBUTION_TABLE)
+        ->condition('field_name', $field_name)
+        ->condition('entity_type', $entity_type)
+        ->condition('entity_id', $id)
+        ->condition('language', $languages, 'IN')
+        ->execute();
+
+      db_delete(IMAGE_ATTRIBUTION_REVISION_TABLE)
+        ->condition('field_name', $field_name)
+        ->condition('entity_type', $entity_type)
+        ->condition('entity_id', $id)
+        ->condition('revision_id', $vid)
+        ->condition('language', $languages, 'IN')
+        ->execute();
+    }
+
+    // Prepare the multi-insert query.
+    $do_insert = FALSE;
+    $columns = array('field_name', 'entity_type', 'entity_id', 'revision_id', 'bundle', 'delta', 'language', 'attribution');
+    $query = db_insert(IMAGE_ATTRIBUTION_TABLE)->fields($columns);
+    $revision_query = db_insert(IMAGE_ATTRIBUTION_REVISION_TABLE)->fields($columns);
+
+    foreach ($field_languages as $langcode) {
+
+      $items = (array) $entity->{$field_name}[$langcode];
+      $delta_count = 0;
+      foreach ($items as $delta => $item) {
+        // We now know we have someting to insert.
+        $do_insert = TRUE;
+        $record = array(
+          'field_name' => $field_name,
+          'entity_type' => $entity_type,
+          'entity_id' => $id,
+          'revision_id' => $vid,
+          'bundle' => $bundle,
+          'delta' => $delta,
+          'language' => $langcode,
+          'attribution' => $item['image_attribution'],
+        );
+        $query->values($record);
+        if (isset($vid)) {
+          $revision_query->values($record);
+        }
+
+        if ($field['cardinality'] != FIELD_CARDINALITY_UNLIMITED && ++$delta_count == $field['cardinality']) {
+          break;
+        }
+      }
+    }
+
+    // Execute the query if we have values to insert.
+    if ($do_insert) {
+      $query->execute();
+      $revision_query->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_field_attach_load().
+ */
+function image_attribution_field_attach_load($entity_type, $entities, $age, $options) {
+  foreach ($entities as $entity) {
+    list($id, $vid, $bundle) = entity_extract_ids($entity_type, $entity);
+    if (!isset($vid)) {
+      $vid = $id;
+    }
+
+    $load_current = $age == FIELD_LOAD_CURRENT;
+
+    $table = $load_current ? IMAGE_ATTRIBUTION_TABLE : IMAGE_ATTRIBUTION_REVISION_TABLE;
+
+    $query = db_select($table, 't')
+      ->fields('t')
+      ->condition('entity_type', $entity_type)
+      ->condition($load_current ? 'entity_id' : 'revision_id', $load_current ? $id : $vid)
+      ->orderBy('delta');
+
+    $results = $query->execute();
+
+    foreach ($results as $row) {
+      $field = field_info_instance($entity_type, $row->field_name, $bundle);
+      if (!$field['settings']['image_attribution']) {
+        continue;
+      }
+
+      $item['image_attribution'] = $row->attribution;
+
+      // Add the item to the field values for the entity.
+      $entities[$row->entity_id]->{$row->field_name}[$row->language][$row->delta]['image_attribution'] = $row->attribution;
+    }
+  }
+}
+
+/**
+ * Implements hook_field_attach_delete().
+ */
+function image_attribution_field_attach_delete($entity_type, $entity) {
+  list($id, $vid, $bundle) = entity_extract_ids($entity_type, $entity);
+
+  foreach (field_info_instances($entity_type, $bundle) as $instance) {
+    $field = field_info_field_by_id($instance['field_id']);
+    image_attribution_field_attach_purge($entity_type, $entity, $field, $instance);
+  }
+}
+
+/**
+ * Implements hook_field_attach_purge().
+ */
+function image_attribution_field_attach_purge($entity_type, $entity, $field, $instance) {
+  list($id, $vid, $bundle) = entity_extract_ids($entity_type, $entity);
+
+  db_delete(IMAGE_ATTRIBUTION_TABLE)
+    ->condition('entity_type', $entity_type)
+    ->condition('entity_id', $id)
+    ->execute();
+  db_delete(IMAGE_ATTRIBUTION_REVISION_TABLE)
+    ->condition('entity_type', $entity_type)
+    ->condition('entity_id', $id)
+    ->execute();
+}
+
+/**
+ * Implements hook_field_attach_delete_revision().
+ */
+function image_attribution_field_attach_delete_revision($entity_type, $entity) {
+  list($id, $vid, $bundle) = entity_extract_ids($entity_type, $entity);
+
+  if (isset($vid)) {
+    db_delete(IMAGE_ATTRIBUTION_REVISION_TABLE)
+      ->condition('entity_type', $entity_type)
+      ->condition('entity_id', $id)
+      ->condition('revision_id', $vid)
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_field_diff_view_alter().
+ */
+function image_attribution_field_diff_view_alter(&$values, $items, $context) {
+  $field = $context['field'];
+  $instance = $context['instance'];
+  $settings = $context['settings'];
+
+  // Only handle image fields
+  if ($field['type'] != 'image' || !$instance['settings']['image_attribution']) {
+    return;
+  }
+
+  foreach ($items as $delta => $item) {
+    $values[$delta][] = diff_normalise_text($item['image_attribution']);
+  }
+}
+
+/**
+ * Given an entity type and bundle name, this will return an associative array
+ * of image field info instances, keyed by image field machine names. Returns
+ * null if no image fields are found.
+ */
+function image_attribution_get_image_fields($entity_type, $bundle) {
+  $image_fields = array();
+  $fields = field_info_instances($entity_type, $bundle);
+  foreach ($fields as $field_name => $field) {
+    // Skip any deleted and non image widget fields.
+    if ($field['deleted'] == 1) {
+      continue;
+    }
+
+    $field_info = field_info_field($field_name);
+
+    if ($field_info['type'] != 'image') {
+      continue;
+    }
+    $image_fields[$field_name] = $field;
+  }
+
+  return $image_fields;
+}
+
+/**
+ * Implements phptemplate_preprocess_image_insert_image(&$vars) {
+ */
+function image_attribution_preprocess_image_insert_image(&$vars) {
+  $vars['attribution'] = (!empty($vars['item']['image_attribution'])) ? $vars['item']['image_attribution'] : NULL;
+}
